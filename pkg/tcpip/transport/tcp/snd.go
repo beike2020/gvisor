@@ -566,13 +566,18 @@ func (s *sender) splitSeg(seg *segment, size int) {
 // NextSeg implements the RFC6675 NextSeg() operation. It returns segments that
 // match rule 1, 3 and 4 of the NextSeg() operation defined in RFC6675. Rule 2
 // is handled by the normal send logic.
-func (s *sender) NextSeg() (nextSeg1, nextSeg3, nextSeg4 *segment) {
+// NextSeg starts scanning the writeList starting from nextSegHint and returns
+// the hint to be passed on the next call to NextSeg. This is required to avoid
+// iterating the write list repeatedly when NextSeg is invoked in a loop during
+// recovery.
+func (s *sender) NextSeg(nextSegHint *segment) (nextSeg1, nextSeg3, nextSeg4, hint *segment) {
 	var s3 *segment
 	var s4 *segment
 	smss := s.ep.scoreboard.SMSS()
 	// Step 1.
-	for seg := s.writeList.Front(); seg != nil; seg = seg.Next() {
-		if !s.isAssignedSequenceNumber(seg) {
+	seg := nextSegHint
+	for ; seg != nil; seg = seg.Next() {
+		if !s.isAssignedSequenceNumber(seg) || s.sndNxt.LessThanEq(seg.sequenceNumber) {
 			break
 		}
 		segSeq := seg.sequenceNumber
@@ -595,8 +600,9 @@ func (s *sender) NextSeg() (nextSeg1, nextSeg3, nextSeg4 *segment) {
 				// NextSeg():
 				//     (1.c) IsLost(S2) returns true.
 				if s.ep.scoreboard.IsLost(segSeq) {
-					return seg, s3, s4
+					return seg, s3, s4, seg.Next()
 				}
+
 				// NextSeg():
 				//
 				// (3): If the conditions for rules (1) and (2)
@@ -608,6 +614,7 @@ func (s *sender) NextSeg() (nextSeg1, nextSeg3, nextSeg4 *segment) {
 				// SHOULD be returned.
 				if s3 == nil {
 					s3 = seg
+					hint = seg.Next()
 				}
 			}
 			// NextSeg():
@@ -616,10 +623,11 @@ func (s *sender) NextSeg() (nextSeg1, nextSeg3, nextSeg4 *segment) {
 			//     but there exists outstanding unSACKED data, we
 			//     provide the opportunity for a single "rescue"
 			//     retransmission per entry into loss recovery. If
-			//     HighACK is greater than RescueRxt, the one
+			//     HighACK is greater than RescueRxt, then one
 			//     segment of upto SMSS octects that MUST include
 			//     the highest outstanding unSACKed sequence number
-			//     SHOULD be returned.
+			//     SHOULD be returned, and RescueRxt set to
+			//     RecoveryPoint. HighRxt MUST NOT be updated.
 			if s.fr.rescueRxt.LessThan(s.sndUna - 1) {
 				if s4 != nil {
 					if s4.sequenceNumber.LessThan(segSeq) {
@@ -629,11 +637,12 @@ func (s *sender) NextSeg() (nextSeg1, nextSeg3, nextSeg4 *segment) {
 					s4 = seg
 				}
 				s.fr.rescueRxt = s.fr.last
+				hint = nil
 			}
 		}
 	}
 
-	return nil, s3, s4
+	return nil, s3, s4, hint
 }
 
 // maybeSendSegment tries to send the specified segment and either coalesces
@@ -757,8 +766,10 @@ func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value) (se
 // section 5, step C.
 func (s *sender) handleSACKRecovery(limit int, end seqnum.Value) (dataSent bool) {
 	s.SetPipe()
+	nextSegHint := s.writeList.Front()
 	for s.outstanding < s.sndCwnd {
-		nextSeg, s3, s4 := s.NextSeg()
+		var nextSeg, s3, s4 *segment
+		nextSeg, s3, s4, nextSegHint = s.NextSeg(nextSegHint)
 		if nextSeg == nil {
 			// NextSeg():
 			//
@@ -772,6 +783,7 @@ func (s *sender) handleSACKRecovery(limit int, end seqnum.Value) (dataSent bool)
 				if s.isAssignedSequenceNumber(seg) && seg.sequenceNumber.LessThan(s.sndNxt) {
 					continue
 				}
+
 				// Step C.3 described below is handled by
 				// maybeSendSegment which increments sndNxt when
 				// a segment is transmitted.
@@ -896,6 +908,8 @@ func (s *sender) enterFastRecovery() {
 	s.fr.first = s.sndUna
 	s.fr.last = s.sndNxt - 1
 	s.fr.maxCwnd = s.sndCwnd + s.outstanding
+	s.fr.highRxt = s.sndUna
+	s.fr.rescueRxt = s.sndUna
 	if s.ep.sackPermitted {
 		s.state = SACKRecovery
 		s.ep.stack.Stats().TCP.SACKRecovery.Increment()
@@ -1170,6 +1184,7 @@ func (s *sender) handleRcvdSegment(seg *segment) {
 			if s.writeNext == seg {
 				s.writeNext = seg.Next()
 			}
+
 			s.writeList.Remove(seg)
 
 			// if SACK is enabled then Only reduce outstanding if
